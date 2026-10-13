@@ -303,7 +303,9 @@ body.screenmode .hostbar,body.screenmode .st-counter{display:none!important}
   </div>
 </div>
 <div id="playMain" class="screen pw">
-  <div class="phead"><div class="pname" id="pNick"></div><div class="pscore">⭐ <span id="pScore">0</span></div></div>
+  <div class="phead"><div class="pname" id="pNick"></div>
+    <div class="row"><div class="pscore">⭐ <span id="pScore">0</span></div>
+    <button class="btn ghost sm" onclick="leaveSession()">Quitter</button></div></div>
   <div class="pbody" id="pBody"></div>
 </div>
 
@@ -865,6 +867,8 @@ async function startLive(){
   await flushSave();
   if(!items.length){alert("Ajoutez au moins un élément.");return;}
   liveQuiz=quiz; live=items.slice(); soundLvl=liveQuiz.settings.sound??1;
+  // clôt les sessions précédentes de ce quiz : les téléphones encore connectés sont libérés
+  await sb.from('sessions').update({status:'ended'}).eq('quiz_id',quiz.id).neq('status','ended');
   const {data}=await sb.from('sessions').insert({quiz_id:quiz.id,pin:pin6(),status:'lobby',item_index:0,
     config:{teams:liveQuiz.settings.teams??0,teamNames:liveQuiz.settings.teamNames||''}}).select().single();
   S=data; idx=0; parts={}; answers={}; scored={};
@@ -1230,6 +1234,7 @@ async function manualFs(){ try{ await document.documentElement.requestFullscreen
    ============================================================ */
 let rSession=null,rItems=[];
 async function initRemote(){
+  if(!configured){document.body.innerHTML='<div class="empty">Connexion indisponible. Réessayez dans un instant.</div>';return;}
   const sid=P.get('s'); if(!sid){document.body.innerHTML='<div class="empty">Lien invalide.</div>';return;}
   show('remote');
   const {data:s}=await sb.from('sessions').select('*').eq('id',sid).maybeSingle();
@@ -1291,8 +1296,11 @@ async function checkPin(){
 function subPlayer(){
   sb.channel('p'+mySid).on('postgres_changes',{event:'UPDATE',schema:'public',table:'sessions',filter:'id=eq.'+mySid},p=>pState(p.new)).subscribe();
   setInterval(async()=>{ if(!mySid)return; const {data}=await sb.from('sessions').select('*').eq('id',mySid).maybeSingle(); if(data)pState(data); },2500);
-  document.addEventListener('visibilitychange',async()=>{ if(document.hidden||!mySid)return;
-    const {data}=await sb.from('sessions').select('*').eq('id',mySid).maybeSingle(); if(data)pState(data); });
+  const resync=async()=>{ if(!mySid)return;
+    const {data}=await sb.from('sessions').select('*').eq('id',mySid).maybeSingle(); if(data)pState(data); };
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden) resync(); });
+  window.addEventListener('focus',resync);
+  window.addEventListener('online',resync);
 }
 function pState(s){
   if(!s)return; const key=s.status+':'+s.item_index; if(key===lastKey)return; lastKey=key;
@@ -1413,6 +1421,7 @@ async function playerEnd(){
    ============================================================ */
 let soItems=[],soIdx=0,soScore=0,soAnswered=false,soSel=[];
 async function initSolo(){
+  if(!configured){document.body.innerHTML='<div class="empty">Connexion indisponible. Réessayez dans un instant.</div>';return;}
   const qid=P.get('q'); if(!qid){document.body.innerHTML='<div class="empty">Lien invalide.</div>';return;}
   show('solo');
   const {data:q}=await sb.from('quizzes').select('*').eq('id',qid).maybeSingle();
@@ -1518,9 +1527,16 @@ function boot(){
   show('login');
   if(configured) sb.auth.getSession().then(({data})=>{ if(data&&data.session){me=data.session.user;enterApp();} });
 }
+function leaveSession(){
+  localStorage.removeItem('qs_player');
+  mySid=null; myPid=null; lastKey='';
+  location.href=BASE+'?r=play';
+}
 async function rejoin(sv){
   const {data:s}=await sb.from('sessions').select('*').eq('id',sv.s).maybeSingle();
-  if(!s||s.status==='ended'){localStorage.removeItem('qs_player');return;}
+  // session terminée, introuvable, ou vieille de plus de 6 h : on repart sur l'écran de connexion
+  const old = s && (Date.now()-new Date(s.created_at).getTime() > 6*3600*1000);
+  if(!s||s.status==='ended'||old){localStorage.removeItem('qs_player');return;}
   const {data:p}=await sb.from('participants').select('*').eq('id',sv.p).maybeSingle();
   if(!p){localStorage.removeItem('qs_player');return;}
   mySid=s.id; myPid=p.id; myNick=p.nickname; myScore=p.score||0;
