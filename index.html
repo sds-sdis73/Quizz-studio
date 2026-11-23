@@ -480,7 +480,28 @@ async function doLogin(){
   me=data.user; await enterApp();
 }
 async function doLogout(){ await sb.auth.signOut(); location.href=BASE; }
-async function enterApp(){ el('whoami').textContent=me.email; await loadFolders(); await loadQuizzes(); show('library'); }
+async function enterApp(){ el('whoami').textContent=me.email; await loadFolders(); await loadQuizzes(); show('library'); checkOpenSession(); }
+async function checkOpenSession(){
+  let h=null; try{ h=JSON.parse(localStorage.getItem('qs_host')||'null'); }catch(e){}
+  if(!h)return;
+  const {data:s}=await sb.from('sessions').select('*').eq('id',h.s).maybeSingle();
+  const old=!s||s.status==='ended'||Date.now()-new Date(s.created_at).getTime()>6*3600*1000;
+  if(old){ try{localStorage.removeItem('qs_host');}catch(e){} return; }
+  const q=quizzes.find(x=>x.id===s.quiz_id);
+  const {data:pp}=await sb.from('participants').select('id').eq('session_id',s.id);
+  const bar=document.createElement('div');
+  bar.id='resumeBar';
+  bar.style.cssText='background:#1f3a2a;color:#9ff0c4;padding:12px 16px;border-radius:12px;margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap';
+  bar.innerHTML=`<div class="grow">🔴 Session en cours — <b>${esc(q?q.title:'formation')}</b>, PIN ${esc(s.pin)}, ${(pp||[]).length} participant(s)</div>
+    <button class="btn sm" onclick="resumeLive('${s.id}')">Reprendre</button>
+    <button class="btn ghost sm" onclick="closeOpenSession('${s.id}')">Terminer</button>`;
+  el('quizGrid').parentNode.insertBefore(bar,el('quizGrid'));
+}
+async function closeOpenSession(sid){
+  await sb.from('sessions').update({status:'ended'}).eq('id',sid);
+  try{localStorage.removeItem('qs_host');}catch(e){}
+  const b=el('resumeBar'); if(b)b.remove();
+}
 
 async function loadFolders(){ const {data}=await sb.from('folders').select('*').order('name'); folders=data||[]; renderFolders(); }
 function renderFolders(){
@@ -863,23 +884,83 @@ function pin6(){ return String(Math.floor(100000+Math.random()*900000)); }
 function teamList(){ return (liveQuiz.settings.teamNames||'Rouge, Bleu, Jaune').split(',').map(s=>s.trim()).filter(Boolean); }
 function speedOn(){ return (liveQuiz.settings.speed??1)===1; }
 
+// Toute écriture de l'animateur passe ici : le compteur rev permet aux téléphones
+// de rejeter un état périmé arrivé en retard (course temps réel / sondage).
+async function sessUpdate(patch){
+  const cfg=Object.assign({},S.config||{},{rev:((S.config&&S.config.rev)||0)+1});
+  const {data}=await sb.from('sessions').update(Object.assign({},patch,{config:cfg})).eq('id',S.id).select().single();
+  if(data) S=data; else { S=Object.assign({},S,patch,{config:cfg}); }
+  return S;
+}
+function hostChannel(){
+  let ch=null,retry=0;
+  const open=()=>{
+    if(ch){ try{sb.removeChannel(ch);}catch(e){} }
+    ch=sb.channel('s'+S.id+'-'+Date.now())
+      .on('postgres_changes',{event:'INSERT',schema:'public',table:'participants',filter:'session_id=eq.'+S.id},p=>addPart(p.new))
+      .on('postgres_changes',{event:'INSERT',schema:'public',table:'responses',filter:'session_id=eq.'+S.id},p=>onResp(p.new))
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'sessions',filter:'id=eq.'+S.id},p=>onRemoteCmd(p.new))
+      .subscribe(st=>{
+        if(st==='SUBSCRIBED'){retry=0;return;}
+        if(st==='CHANNEL_ERROR'||st==='TIMED_OUT'||st==='CLOSED'){
+          retry++; setTimeout(open,Math.min(15000,1000*retry)); }
+      });
+  };
+  open();
+}
 async function startLive(){
   await flushSave();
   if(!items.length){alert("Ajoutez au moins un élément.");return;}
+  // session encore ouverte pour ce quiz ? on propose de la reprendre plutôt que d'éjecter tout le monde
+  const {data:open}=await sb.from('sessions').select('*').eq('quiz_id',quiz.id).neq('status','ended')
+    .order('created_at',{ascending:false}).limit(1).maybeSingle();
+  if(open && Date.now()-new Date(open.created_at).getTime()<6*3600*1000){
+    const {data:pp}=await sb.from('participants').select('id').eq('session_id',open.id);
+    const n=(pp||[]).length;
+    if(n>0 && confirm(`Une session est déjà en cours (PIN ${open.pin}, ${n} participant${n>1?'s':''}).\n\nOK = reprendre cette session\nAnnuler = en créer une nouvelle (les participants devront se reconnecter)`)){
+      return resumeLive(open.id);
+    }
+  }
   liveQuiz=quiz; live=items.slice(); soundLvl=liveQuiz.settings.sound??1;
-  // clôt les sessions précédentes de ce quiz : les téléphones encore connectés sont libérés
   await sb.from('sessions').update({status:'ended'}).eq('quiz_id',quiz.id).neq('status','ended');
   const {data}=await sb.from('sessions').insert({quiz_id:quiz.id,pin:pin6(),status:'lobby',item_index:0,
-    config:{teams:liveQuiz.settings.teams??0,teamNames:liveQuiz.settings.teamNames||''}}).select().single();
+    config:{rev:1,teams:liveQuiz.settings.teams??0,teamNames:liveQuiz.settings.teamNames||''}}).select().single();
   S=data; idx=0; parts={}; answers={}; scored={};
+  try{ localStorage.setItem('qs_host',JSON.stringify({s:S.id,q:quiz.id})); }catch(e){}
   applyTheme(liveQuiz.theme);
-  sb.channel('s'+S.id)
-    .on('postgres_changes',{event:'INSERT',schema:'public',table:'participants',filter:'session_id=eq.'+S.id},p=>addPart(p.new))
-    .on('postgres_changes',{event:'INSERT',schema:'public',table:'responses',filter:'session_id=eq.'+S.id},p=>onResp(p.new))
-    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'sessions',filter:'id=eq.'+S.id},p=>onRemoteCmd(p.new))
-    .subscribe();
+  hostChannel();
   setInterval(refreshParts,3000);
   show(''); el('stageView').classList.add('on'); renderLobby();
+}
+// Reprise d'une session après rechargement de la page animateur
+async function resumeLive(sid){
+  const {data:sess}=await sb.from('sessions').select('*').eq('id',sid).maybeSingle();
+  if(!sess||sess.status==='ended'){ alert('Cette session est terminée.'); try{localStorage.removeItem('qs_host');}catch(e){} return; }
+  const {data:q}=await sb.from('quizzes').select('*').eq('id',sess.quiz_id).maybeSingle();
+  const {data:its}=await sb.from('items').select('*').eq('quiz_id',sess.quiz_id).order('position');
+  if(!q||!its||!its.length){ alert('Formation introuvable.'); return; }
+  quiz=q; items=its; liveQuiz=q; live=its.slice(); soundLvl=q.settings.sound??1;
+  S=sess; idx=S.item_index; parts={}; answers={}; scored={};
+  const {data:pp}=await sb.from('participants').select('id,nickname,team,score').eq('session_id',S.id);
+  (pp||[]).forEach(p=>parts[p.id]={name:p.nickname,team:p.team,score:p.score||0});
+  const {data:rr}=await sb.from('responses').select('item_index,is_correct,participant_id').eq('session_id',S.id);
+  (rr||[]).forEach(r=>{ if(r.is_correct!==null) scored[r.item_index]=true;
+    if(r.item_index===idx) answers[r.participant_id]=r; });
+  revealed=!!scored[idx] && S.status==='reveal';
+  try{ localStorage.setItem('qs_host',JSON.stringify({s:S.id,q:quiz.id})); }catch(e){}
+  applyTheme(liveQuiz.theme);
+  hostChannel();
+  setInterval(refreshParts,3000);
+  show(''); el('stageView').classList.add('on');
+  const it=live[idx];
+  if(S.status==='lobby'||!it){ renderLobby(); }
+  else if(it.kind==='slide'){ paintSlide(it); }
+  else if(S.status==='reveal'){ await hostReveal(true); }
+  else { paintQuestion(it.payload);
+    const elapsed=Math.floor((Date.now()-new Date(S.q_started_at).getTime())/1000);
+    tLeft=Math.max(0,timerSecs(it.payload)-elapsed);
+    if(tLeft<=0) hostReveal(); else startTimer(it.payload,true); }
+  renderPresenter();
 }
 function applyTheme(t){
   if(!t)return;
@@ -919,29 +1000,25 @@ async function gotoStep(i){
   idx=i; revealed=false; answers={}; paused=false; clearInterval(tmr);
   const it=live[idx];
   if(it.kind==='slide'){
-    await sb.from('sessions').update({status:'slide',item_index:idx}).eq('id',S.id);
+    await sessUpdate({status:'slide',item_index:idx,paused_at:null});
     paintSlide(it); send({v:'slide',it:it.payload,i:idx,n:live.length});
   } else {
     const q=it.payload;
-    if(['open','word','poll'].includes(q.type)){
-      const {data}=await sb.from('sessions').update({status:'question',item_index:idx,q_started_at:new Date().toISOString()}).eq('id',S.id).select().single();
-      S=data; paintQuestion(q); send({v:'question',q:q,i:idx,n:live.length,t:S.q_started_at,tot:Object.keys(parts).length});
-      startTimer(q);
-    } else {
-      const {data}=await sb.from('sessions').update({status:'question',item_index:idx,q_started_at:new Date().toISOString()}).eq('id',S.id).select().single();
-      S=data; paintQuestion(q); send({v:'question',q:q,i:idx,n:live.length,t:S.q_started_at,tot:Object.keys(parts).length});
-      startTimer(q);
-    }
+    await sessUpdate({status:'question',item_index:idx,q_started_at:new Date().toISOString(),paused_at:null});
+    paintQuestion(q); send({v:'question',q:q,i:idx,n:live.length,t:S.q_started_at,tot:Object.keys(parts).length});
+    startTimer(q);
   }
   renderPresenter();
 }
 function hostNext(){ gotoStep(idx+1); }
 function hostPrev(){ gotoStep(idx-1); }
-function hostPause(){
+async function hostPause(){
+  const it=live[idx]; if(!it||it.kind!=='question'||revealed)return;
   paused=!paused;
-  if(paused) clearInterval(tmr); else startTimer(live[idx].payload,true);
+  if(paused) clearInterval(tmr); else startTimer(it.payload,true);
   const b=el('pPause'); if(b)b.textContent=paused?'▶ Reprendre':'⏸ Pause';
   send({v:'pause',p:paused});
+  await sessUpdate({paused_at:paused?new Date().toISOString():null});
 }
 function timerSecs(q){ return q.timer||liveQuiz.settings.timer||45; }
 let tLeft=0;
@@ -1021,9 +1098,9 @@ function onResp(r){
   } else send({v:'counts',c:{},n:n,tot:tot});
   if(tot>0&&n>=tot){ const at=idx; setTimeout(()=>{ if(!revealed&&idx===at) hostReveal(); },700); }
 }
-async function hostReveal(){
+async function hostReveal(redraw){
   const it=live[idx]; if(!it||it.kind!=='question')return;
-  if(revealed)return; revealed=true; clearInterval(tmr);
+  if(revealed && !redraw)return; revealed=true; clearInterval(tmr);
   const q=it.payload;
   await refreshParts();
   const {data:raw}=await sb.from('responses').select('*').eq('session_id',S.id).eq('item_index',idx);
@@ -1044,8 +1121,8 @@ async function hostReveal(){
   const lb=board();
   paintReveal(q,counts,list,lb);
   send({v:'reveal',q:q,c:counts,lb:lb,words:wordsOf(q,list)});
-  await sb.from('sessions').update({status:'reveal',item_index:idx}).eq('id',S.id);
-  SFX.good(); renderPresenter();
+  await sessUpdate({status:'reveal',item_index:idx,paused_at:null});
+  if(!redraw) SFX.good(); renderPresenter();
 }
 function wordsOf(q,list){
   if(!['open','word'].includes(q.type))return null;
@@ -1081,7 +1158,8 @@ function paintReveal(q,counts,list,lb){
 }
 async function endLive(){
   clearInterval(tmr); SFX.end();
-  await sb.from('sessions').update({status:'ended',item_index:idx}).eq('id',S.id);
+  await sessUpdate({status:'ended',item_index:idx});
+  try{ localStorage.removeItem('qs_host'); }catch(e){}
   const lb=board();
   el('stageView').classList.remove('slide');
   el('stCounter').textContent='Terminé';
@@ -1278,10 +1356,8 @@ async function joinGame(){
   const {data:p,error}=await sb.from('participants').insert({session_id:s.id,nickname:nick,team:team,score:0}).select().single();
   if(error){e.textContent=error.message;return;}
   mySid=s.id; myPid=p.id; myNick=nick; myScore=0;
-  localStorage.setItem('qs_player',JSON.stringify({s:s.id,p:p.id,n:nick}));
-  const {data:q}=await sb.from('quizzes').select('*').eq('id',s.quiz_id).maybeSingle();
-  const {data:its}=await sb.from('items').select('*').eq('quiz_id',s.quiz_id).order('position');
-  myQuiz=q; myItems=its||[]; soundLvl=(q&&q.settings&&q.settings.sound)??1;
+  try{ localStorage.setItem('qs_player',JSON.stringify({s:s.id,p:p.id,n:nick})); }catch(e){}
+  await loadContent(s.quiz_id);
   el('pNick').textContent=nick; show('playMain'); subPlayer(); pState(s);
 }
 async function checkPin(){
@@ -1293,28 +1369,71 @@ async function checkPin(){
     el('teamPick').classList.remove('hide');
   } else el('teamPick').classList.add('hide');
 }
+// Contenu de la formation (rechargeable si une étape est introuvable)
+let myQuizId=null;
+async function loadContent(qid){
+  myQuizId=qid;
+  const {data:q}=await sb.from('quizzes').select('*').eq('id',qid).maybeSingle();
+  const {data:its}=await sb.from('items').select('*').eq('quiz_id',qid).order('position');
+  if(q) myQuiz=q; if(its&&its.length) myItems=its;
+  soundLvl=(myQuiz&&myQuiz.settings&&myQuiz.settings.sound)??1;
+}
+let pChan=null,pRetry=0,lastRev=-1;
 function subPlayer(){
-  sb.channel('p'+mySid).on('postgres_changes',{event:'UPDATE',schema:'public',table:'sessions',filter:'id=eq.'+mySid},p=>pState(p.new)).subscribe();
-  setInterval(async()=>{ if(!mySid)return; const {data}=await sb.from('sessions').select('*').eq('id',mySid).maybeSingle(); if(data)pState(data); },2500);
-  const resync=async()=>{ if(!mySid)return;
-    const {data}=await sb.from('sessions').select('*').eq('id',mySid).maybeSingle(); if(data)pState(data); };
+  const open=()=>{
+    if(pChan){ try{sb.removeChannel(pChan);}catch(e){} }
+    pChan=sb.channel('p'+mySid+'-'+Date.now())
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'sessions',filter:'id=eq.'+mySid},p=>pState(p.new))
+      .subscribe(st=>{
+        if(st==='SUBSCRIBED'){ pRetry=0; resync(); return; }
+        if(st==='CHANNEL_ERROR'||st==='TIMED_OUT'||st==='CLOSED'){ pRetry++; setTimeout(open,Math.min(15000,1000*pRetry)); }
+      });
+  };
+  open();
+  setInterval(resync,2500);
   document.addEventListener('visibilitychange',()=>{ if(!document.hidden) resync(); });
   window.addEventListener('focus',resync);
   window.addEventListener('online',resync);
 }
-function pState(s){
-  if(!s)return; const key=s.status+':'+s.item_index; if(key===lastKey)return; lastKey=key;
+async function resync(){
+  if(!mySid)return;
+  try{ const {data}=await sb.from('sessions').select('*').eq('id',mySid).maybeSingle(); if(data)pState(data); }catch(e){}
+}
+function setPause(on){
+  let b=el('pauseBanner');
+  if(on){ if(!b){ b=document.createElement('div'); b.id='pauseBanner'; b.className='multihint';
+      b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:50;background:#ff8c33;color:#1a0d00';
+      b.textContent='⏸ Chronomètre en pause'; document.body.appendChild(b); } }
+  else if(b) b.remove();
+}
+async function pState(s){
+  if(!s)return;
+  // rejette un état périmé (réponse de sondage arrivée après une notification plus récente)
+  const rev=(s.config&&s.config.rev)||0;
+  if(rev<lastRev)return; lastRev=rev;
+  setPause(s.status==='question' && !!s.paused_at);
+  const key=s.status+':'+s.item_index; if(key===lastKey)return; lastKey=key;
   const b=el('pBody');
   if(s.status==='lobby'||s.status==='slide'){ clearInterval(myTimer); curIdx=s.item_index;
     b.style.padding='16px';
     b.innerHTML=`<div class="waiticon">👀</div><div class="waittxt">Regardez l'écran</div>
       <div class="sub">${s.status==='lobby'?'En attente du démarrage…':'Suivez la présentation'}</div>`; return; }
-  if(s.status==='question'){ curIdx=s.item_index; ansStep=-1; mySel=[]; playerQuestion(s); return; }
+  if(s.status==='question'){ curIdx=s.item_index; ansStep=-1; mySel=[]; await playerQuestion(s); return; }
   if(s.status==='reveal'){ playerReveal(s); return; }
   if(s.status==='ended'){ playerEnd(); return; }
 }
-function playerQuestion(s){
-  const it=myItems[s.item_index]; if(!it||it.kind!=='question')return;
+async function playerQuestion(s){
+  let it=myItems[s.item_index];
+  if(!it||it.kind!=='question'){
+    // contenu absent ou modifié depuis l'inscription : on le recharge une fois
+    if(myQuizId) await loadContent(myQuizId);
+    it=myItems[s.item_index];
+    if(!it||it.kind!=='question'){
+      lastKey=''; // le prochain cycle de synchronisation réessaiera
+      el('pBody').innerHTML='<div class="waiticon">⏳</div><div class="waittxt">Synchronisation…</div>';
+      return;
+    }
+  }
   const q=it.payload,b=el('pBody'); b.innerHTML=''; b.style.padding='0';
   const multi=q.type==='multi';
   if(multi) b.insertAdjacentHTML('beforeend',`<div class="multihint">Plusieurs réponses — sélectionnez puis validez</div>`);
@@ -1352,10 +1471,7 @@ function playerQuestion(s){
       <div class="pinstage" id="pinP" onclick="pinTap(event,${s.item_index})"><img src="${esc(q.media)}"></div>
       <div class="sub">Touchez l'image à l'endroit voulu.</div>`;
   }
-  const t0=new Date(s.q_started_at).getTime(),tot=(q.timer||(myQuiz.settings.timer||45))*1000;
   clearInterval(myTimer);
-  myTimer=setInterval(()=>{ if(Date.now()-t0>=tot){clearInterval(myTimer);
-    document.querySelectorAll('.pbtn').forEach(x=>x.classList.add('locked'));} },500);
 }
 function paintOrder(q){
   const l=el('ordL'); if(!l)return;
@@ -1518,7 +1634,7 @@ function boot(){
     show('playJoin');
     if(!configured){el('pCfg').classList.remove('hide');el('pCfg').textContent='Application non configurée.';}
     el('pinInput').addEventListener('input',checkPin);
-    const sv=JSON.parse(localStorage.getItem('qs_player')||'null');
+    let sv=null; try{ sv=JSON.parse(localStorage.getItem('qs_player')||'null'); }catch(e){}
     if(sv&&configured) rejoin(sv);
     return;
   }
@@ -1528,7 +1644,7 @@ function boot(){
   if(configured) sb.auth.getSession().then(({data})=>{ if(data&&data.session){me=data.session.user;enterApp();} });
 }
 function leaveSession(){
-  localStorage.removeItem('qs_player');
+  try{ localStorage.removeItem('qs_player'); }catch(e){}
   mySid=null; myPid=null; lastKey='';
   location.href=BASE+'?r=play';
 }
@@ -1536,13 +1652,11 @@ async function rejoin(sv){
   const {data:s}=await sb.from('sessions').select('*').eq('id',sv.s).maybeSingle();
   // session terminée, introuvable, ou vieille de plus de 6 h : on repart sur l'écran de connexion
   const old = s && (Date.now()-new Date(s.created_at).getTime() > 6*3600*1000);
-  if(!s||s.status==='ended'||old){localStorage.removeItem('qs_player');return;}
+  if(!s||s.status==='ended'||old){try{localStorage.removeItem('qs_player');}catch(e){}return;}
   const {data:p}=await sb.from('participants').select('*').eq('id',sv.p).maybeSingle();
-  if(!p){localStorage.removeItem('qs_player');return;}
+  if(!p){try{localStorage.removeItem('qs_player');}catch(e){}return;}
   mySid=s.id; myPid=p.id; myNick=p.nickname; myScore=p.score||0;
-  const {data:q}=await sb.from('quizzes').select('*').eq('id',s.quiz_id).maybeSingle();
-  const {data:its}=await sb.from('items').select('*').eq('quiz_id',s.quiz_id).order('position');
-  myQuiz=q; myItems=its||[]; soundLvl=(q&&q.settings&&q.settings.sound)??1;
+  await loadContent(s.quiz_id);
   el('pNick').textContent=myNick; el('pScore').textContent=myScore;
   show('playMain'); subPlayer(); pState(s);
 }
